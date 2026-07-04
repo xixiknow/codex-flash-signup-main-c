@@ -255,6 +255,8 @@ int identity_generate_profile_only(struct identity_result *out, char *error,
   generate_birthdate(out->birthdate, sizeof(out->birthdate), &out->age);
   return 0;
 }
+
+size_t identity_to_json(const struct identity_result *identity, char *buf,
                         size_t len) {
   if (buf == NULL || len == 0) return 0;
   if (identity == NULL) {
