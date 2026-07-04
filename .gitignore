@@ -1,0 +1,9 @@
+build/
+web/dist/
+web/node_modules/
+.DS_Store
+*.log
+.vscode/
+tmp/
+data/
+.claude/

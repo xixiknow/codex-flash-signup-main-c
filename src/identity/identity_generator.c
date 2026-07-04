@@ -1,0 +1,273 @@
+#include "identity/identity_generator.h"
+
+#include "mongoose.h"
+#include "name/name_generator.h"
+
+#include <ctype.h>
+#include <sqlite3.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+struct domain_rule_row {
+  char base_domain[IDENTITY_DOMAIN_LEN];
+  int wildcard_depth;
+};
+
+static uint64_t random_u64(void) {
+  uint64_t value = 0;
+  if (!mg_random(&value, sizeof(value))) {
+    value = ((uint64_t) rand() << 32) ^ (uint64_t) rand();
+  }
+  return value;
+}
+
+static unsigned random_bounded(unsigned count) {
+  return count == 0 ? 0 : (unsigned) (random_u64() % count);
+}
+
+static void set_error(char *error, size_t error_len, const char *message) {
+  if (error_len == 0) return;
+  mg_snprintf(error, error_len, "%s", message ? message : "identity error");
+}
+
+static bool is_leap_year(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+static int days_in_month(int year, int month) {
+  static const int days[] = {31, 28, 31, 30, 31, 30,
+                             31, 31, 30, 31, 30, 31};
+  if (month == 2 && is_leap_year(year)) return 29;
+  if (month < 1 || month > 12) return 30;
+  return days[month - 1];
+}
+
+static int exact_age(int year, int month, int day, const struct tm *now_tm) {
+  int age = (now_tm->tm_year + 1900) - year;
+  int now_month = now_tm->tm_mon + 1;
+  int now_day = now_tm->tm_mday;
+  if (month > now_month || (month == now_month && day > now_day)) age--;
+  return age;
+}
+
+static void generate_birthdate(char *out, size_t out_len, int *age_out) {
+  time_t now = time(NULL);
+  struct tm now_tm_storage;
+  struct tm *now_tm = localtime_r(&now, &now_tm_storage);
+  int year, month, day, age;
+
+  if (now_tm == NULL) {
+    mg_snprintf(out, out_len, "2001-01-01");
+    if (age_out != NULL) *age_out = 24;
+    return;
+  }
+
+  do {
+    int current_year = now_tm->tm_year + 1900;
+    year = current_year - 25 + (int) random_bounded(7);
+    month = 1 + (int) random_bounded(12);
+    day = 1 + (int) random_bounded((unsigned) days_in_month(year, month));
+    age = exact_age(year, month, day, now_tm);
+  } while (age < 19 || age > 25);
+
+  mg_snprintf(out, out_len, "%04d-%02d-%02d", year, month, day);
+  if (age_out != NULL) *age_out = age;
+}
+
+static void normalize_name_local(const char *name, char *out, size_t out_len) {
+  size_t n = 0;
+  if (out_len == 0) return;
+  for (size_t i = 0; name != NULL && name[i] && n + 1 < out_len; i++) {
+    unsigned char ch = (unsigned char) name[i];
+    if (isalnum(ch)) out[n++] = (char) tolower(ch);
+  }
+  if (n == 0 && out_len > 1) out[n++] = 'u';
+  out[n] = '\0';
+}
+
+static char random_alnum(void) {
+  static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+  return chars[random_bounded((unsigned) strlen(chars))];
+}
+
+static void append_soft_run_suffix(char *local, size_t local_len) {
+  size_t len = strlen(local);
+  unsigned suffix_len = random_bounded(9);
+  char last = '\0';
+
+  for (unsigned i = 0; i < suffix_len && len + 1 < local_len; i++) {
+    char next;
+    if (last != '\0' && random_bounded(100) < 55) {
+      next = last;
+    } else {
+      next = random_alnum();
+    }
+    local[len++] = next;
+    local[len] = '\0';
+    last = next;
+  }
+}
+
+static bool pick_domain_rule(sqlite3 *db, struct domain_rule_row *row,
+                             char *error, size_t error_len) {
+  sqlite3_stmt *stmt = NULL;
+  const char *sql =
+      "SELECT base_domain,wildcard_depth FROM mail_domain_rules "
+      "WHERE is_active=1 ORDER BY random() LIMIT 1";
+
+  memset(row, 0, sizeof(*row));
+  if (db == NULL) {
+    set_error(error, error_len, "数据库未打开");
+    return false;
+  }
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    set_error(error, error_len, sqlite3_errmsg(db));
+    return false;
+  }
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    const unsigned char *domain = sqlite3_column_text(stmt, 0);
+    mg_snprintf(row->base_domain, sizeof(row->base_domain), "%s",
+                domain == NULL ? "" : (const char *) domain);
+    row->wildcard_depth = sqlite3_column_int(stmt, 1);
+    sqlite3_finalize(stmt);
+    return row->base_domain[0] != '\0';
+  }
+  sqlite3_finalize(stmt);
+  set_error(error, error_len, "请先在邮件配置中添加可用域名");
+  return false;
+}
+
+static void generate_domain_label(char *out, size_t out_len) {
+  unsigned len = 1 + random_bounded(5);
+  size_t n = 0;
+  if (out_len == 0) return;
+  for (unsigned i = 0; i < len && n + 1 < out_len; i++) {
+    out[n++] = random_alnum();
+  }
+  out[n] = '\0';
+}
+
+static void build_email_domain(const struct domain_rule_row *rule, char *out,
+                               size_t out_len) {
+  struct mg_iobuf io = {0, 0, 0, 128};
+  int depth = rule->wildcard_depth;
+
+  if (depth < 0) depth = 0;
+  for (int i = 0; i < depth; i++) {
+    char label[8];
+    generate_domain_label(label, sizeof(label));
+    mg_xprintf(mg_pfn_iobuf, &io, "%s.", label);
+  }
+  mg_xprintf(mg_pfn_iobuf, &io, "%s", rule->base_domain);
+  mg_iobuf_add(&io, io.len, "", 1);
+  mg_snprintf(out, out_len, "%s", io.buf ? (char *) io.buf : "");
+  mg_iobuf_free(&io);
+}
+
+static void generate_password(char *out, size_t out_len) {
+  static const char chars[] =
+      "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
+  size_t n = 0;
+  size_t len = 18 + random_bounded(7);
+  if (out_len == 0) return;
+  while (n < len && n + 1 < out_len) {
+    out[n++] = chars[random_bounded((unsigned) strlen(chars))];
+  }
+  out[n] = '\0';
+}
+
+static bool email_exists(sqlite3 *db, const char *email) {
+  sqlite3_stmt *stmt = NULL;
+  bool exists = false;
+  if (db == NULL || email == NULL || email[0] == '\0') return false;
+  if (sqlite3_prepare_v2(db, "SELECT 1 FROM accounts WHERE email=? LIMIT 1",
+                         -1, &stmt, NULL) != SQLITE_OK) {
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, email, -1, SQLITE_TRANSIENT);
+  exists = sqlite3_step(stmt) == SQLITE_ROW;
+  sqlite3_finalize(stmt);
+  return exists;
+}
+
+int identity_generate(sqlite3 *db, struct identity_result *out, char *error,
+                      size_t error_len) {
+  struct generated_name name;
+  struct domain_rule_row rule;
+  int attempts = 0;
+
+  if (out == NULL) {
+    set_error(error, error_len, "identity output is null");
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  if (!pick_domain_rule(db, &rule, error, error_len)) return -1;
+
+  do {
+    if (name_generator_generate(&name) != 0) {
+      set_error(error, error_len, "姓名生成失败");
+      return -1;
+    }
+    mg_snprintf(out->full_name, sizeof(out->full_name), "%s", name.full_name);
+    mg_snprintf(out->given_name, sizeof(out->given_name), "%s",
+                name.given_name);
+    mg_snprintf(out->family_name, sizeof(out->family_name), "%s",
+                name.family_name);
+    normalize_name_local(out->full_name, out->email_local,
+                         sizeof(out->email_local));
+    append_soft_run_suffix(out->email_local, sizeof(out->email_local));
+    build_email_domain(&rule, out->email_domain, sizeof(out->email_domain));
+    mg_snprintf(out->email, sizeof(out->email), "%s@%s", out->email_local,
+                out->email_domain);
+    attempts++;
+  } while (attempts < 16 && email_exists(db, out->email));
+
+  if (email_exists(db, out->email)) {
+    set_error(error, error_len, "生成邮箱与现有账号重复");
+    return -1;
+  }
+  generate_password(out->password, sizeof(out->password));
+  generate_birthdate(out->birthdate, sizeof(out->birthdate), &out->age);
+  return 0;
+}
+
+int identity_generate_profile_only(struct identity_result *out, char *error,
+                                   size_t error_len) {
+  struct generated_name name;
+
+  if (out == NULL) {
+    set_error(error, error_len, "identity output is null");
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  if (name_generator_generate(&name) != 0) {
+    set_error(error, error_len, "姓名生成失败");
+    return -1;
+  }
+  mg_snprintf(out->full_name, sizeof(out->full_name), "%s", name.full_name);
+  mg_snprintf(out->given_name, sizeof(out->given_name), "%s", name.given_name);
+  mg_snprintf(out->family_name, sizeof(out->family_name), "%s",
+              name.family_name);
+  generate_password(out->password, sizeof(out->password));
+  generate_birthdate(out->birthdate, sizeof(out->birthdate), &out->age);
+  return 0;
+}
+                        size_t len) {
+  if (buf == NULL || len == 0) return 0;
+  if (identity == NULL) {
+    return (size_t) mg_snprintf(buf, len, "{}");
+  }
+  return (size_t) mg_snprintf(
+      buf, len,
+      "{%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%m,%m:%d}",
+      MG_ESC("full_name"), MG_ESC(identity->full_name),
+      MG_ESC("given_name"), MG_ESC(identity->given_name),
+      MG_ESC("family_name"), MG_ESC(identity->family_name), MG_ESC("email"),
+      MG_ESC(identity->email), MG_ESC("email_local"),
+      MG_ESC(identity->email_local), MG_ESC("email_domain"),
+      MG_ESC(identity->email_domain), MG_ESC("birthdate"),
+      MG_ESC(identity->birthdate), MG_ESC("age"), identity->age);
+}
