@@ -58,6 +58,8 @@
   let workflow = $state('register_only');
   let concurrency = $state(1);
   let autoUpload = $state(false);
+  let targetWorkspaces = $state('');
+  let aetherPoolType = $state('oauth');
 
   let allVisibleSelected = $derived(items.length > 0 && items.every((item) => selectedIds.includes(item.id)));
 
@@ -212,7 +214,9 @@
           ids,
           workflow,
           concurrency: Math.max(1, Math.min(100, Number(concurrency) || 1)),
-          auto_upload_oauth_success: autoUpload
+          auto_upload_oauth_success: autoUpload,
+          target_workspaces: targetWorkspaces.trim(),
+          aether_pool_type: aetherPoolType
         })
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -338,6 +342,28 @@
         <label class="toggle-row">
           <input type="checkbox" bind:checked={autoUpload} />
           <span>OAuth 成功后自动上传到默认 Aether 服务</span>
+        </label>
+      {/if}
+      <label class="form-field">
+        <span class="form-label">目标工作区 ID</span>
+        <textarea
+          class="input text-mono"
+          rows="3"
+          bind:value={targetWorkspaces}
+          placeholder={'每行一个外部工作区 ID，可用逗号分隔\n填写后将自动：注册 → OAuth → 上车 → 推送 aether'}
+        ></textarea>
+        <p class="form-help">
+          填写目标工作区后自动强制走 <code class="text-mono">注册 → OAuth</code>，
+          再对每个工作区依次上车并各推送一次 aether。留空则按上方流程执行。
+        </p>
+      </label>
+      {#if targetWorkspaces.trim()}
+        <label class="form-field">
+          <span class="form-label">Aether 号池类型</span>
+          <select class="input" bind:value={aetherPoolType}>
+            <option value="oauth">OAuth 号池</option>
+            <option value="chatgpt_web">ChatGPT Web 号池</option>
+          </select>
         </label>
       {/if}
     </div>

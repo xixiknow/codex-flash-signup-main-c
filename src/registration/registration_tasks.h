@@ -49,6 +49,10 @@ struct registration_start_options {
   size_t account_id_count;
   const long *redeem_ids;
   size_t redeem_id_count;
+  /* 兑换码路径：注册+OAuth 完成后，对以下每个外部目标工作区执行
+   * 上车 + 推送 aether（换行/逗号/空格分隔的工作区 ID 列表）。 */
+  const char *target_workspaces;
+  const char *aether_pool_type;
 };
 
 int registration_tasks_start(const struct registration_start_options *options,

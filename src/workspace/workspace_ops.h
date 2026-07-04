@@ -16,4 +16,17 @@ char *workspace_leave_json(sqlite3 *db, const long *ids, size_t count);
 char *workspace_export_json(sqlite3 *db, const long *ids, size_t count,
                             const char *format);
 
+/* 兑换码自动化链路：账号完成 OAuth 拿到 access_token 后，对每个目标工作区
+ * 依次执行「上车（加入外部目标工作区）+ 推送 aether（按该工作区标记一次）」。
+ * target_workspace_ids 为外部共享工作区 ID 数组，每个都会被上车并单独推送一次。
+ * 返回 JSON 结果（ok/join_success/join_failed/push_success/push_failed/details）。
+ * 调用方负责 free。 */
+char *workspace_onboard_and_push_json(sqlite3 *db, const char *email,
+                                      const char *access_token,
+                                      const char *refresh_token,
+                                      const char *external_account_id,
+                                      const char *const *target_workspace_ids,
+                                      size_t target_count,
+                                      const char *pool_type);
+
 #endif

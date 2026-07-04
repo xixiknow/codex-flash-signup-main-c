@@ -130,7 +130,7 @@ APP_AUTH_DISABLED=1 ./build/mongoose-svelte
 - `POST /api/redeem/import` - 批量导入兑换码文本，一行一个并自动去重
 - `POST /api/redeem/delete` - 删除指定兑换码
 - `POST /api/redeem/redeem` - 对选中兑换码调用 `POST /api/v1/redeem` 兑换并回写邮箱与状态
-- `POST /api/redeem/register` - 对选中兑换码创建兑换码注册任务，支持 `workflow=register_only|register_then_oauth`，通过验证码轮询 `GET /api/v1/order/lookup?poll=true` 拿码后注册 GPT 账号
+- `POST /api/redeem/register` - 对选中兑换码创建兑换码注册任务，支持 `workflow=register_only|register_then_oauth`，通过验证码轮询 `GET /api/v1/order/lookup?poll=true` 拿码后注册 GPT 账号；可传 `target_workspaces`（换行/逗号分隔的外部目标工作区 ID）触发「注册 → OAuth → 上车 → 推送 aether」全自动链路，`aether_pool_type=oauth|chatgpt_web` 选择推送号池
 - `GET /api/registration/status` - 查看注册工作台状态、可用域名、活跃代理和临时账号数量
 - `POST /api/registration/start` - 创建注册/OAuth 任务，支持 `register_only`、`register_then_oauth`、`oauth_only`，并可通过 `register_provider=platform|temporary` 选择过期账号注册或临时账号注册
 - `POST /api/registration/stop` - 请求停止指定任务
@@ -183,6 +183,7 @@ x.com
 - 调度模式支持「常规」和「高速模式」。高速模式会将注册流程拆成「前置阶段」「等待邮箱」「后置阶段」三段：只限制验证码前置阶段的并发，进入等待邮箱验证码后释放启动槽，同时用最大存活数控制后台仍在推进的流程总量。
 - `oauth_only` 由账号管理页触发，对选中账号执行 OAuth；OAuth 失败时账号状态保持不变。
 - 兑换码注册由兑换码页触发，使用 `register_provider=redeem`：邮箱来自 paymesh 兑换接口返回的 `emailAddress`，验证码来自 `GET /api/v1/order/lookup?poll=true` 轮询，注册成功后回写兑换码状态为 `registered` 并绑定账号 ID。姓名与生日仍由身份生成器提供。
+- 兑换码页填写「目标工作区 ID」后触发全自动链路：注册成功 → OAuth 拿到 `access_token` → 对每个外部目标工作区依次「上车（`POST /backend-api/accounts/{目标工作区}/invites/request`）+ 推送 aether」。每个目标工作区都会用其自身 `workspaceId` 单独推送一次，推送复用上传配置中已启用的默认 Aether 服务（`aether_pool_type` 决定 OAuth 号池或 ChatGPT Web 号池）。因为上车与推送都需要账号级 `access_token`，填写目标工作区会强制走 `register_then_oauth`。
 - 工作区功能在账号管理页对已入库账号执行：使用账号 `access_token` 加入（`invites/request`）或退出（从 `access_token` 的 JWT 解析用户 ID 后 `DELETE .../users/{user_id}`）工作区，完成后可选择自动导入 Aether 或导出 `codex` / `cpa` / `sub2api` 凭证 JSON。
 - 失败 flow 只释放内存资源，不写入新账号；成功注册通过 `account_insert_success()` 写入账号和密钥表。
 - OAuth 架构放在 `src/oauth/oauth_provider.c`，默认域名先与注册路径保持一致，使用 `https://auth.openai.com`；后续切换私有域时优先从该 provider 的集中配置点调整。

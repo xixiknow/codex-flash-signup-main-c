@@ -14,6 +14,7 @@
 #include "storage/app_db.h"
 #include "system/system_monitor.h"
 #include "upload/aether_upload.h"
+#include "workspace/workspace_ops.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -29,6 +30,8 @@
 #define REG_TASK_ERROR_LEN 256
 #define REG_TASK_LOG_MSG_LEN 768
 #define REG_TASK_MAX_LOGS 4000
+#define REG_TASK_TARGET_WS_LEN 4096
+#define REG_TASK_POOL_TYPE_LEN 32
 #define REG_TASK_IDLE_RETENTION_MS (10ULL * 60ULL * 1000ULL)
 #define OAUTH_RACE_BRANCHES 2
 #define ENVIRONMENT_RETRY_LIMIT 2
@@ -93,6 +96,8 @@ struct registration_task {
   long *redeem_ids;
   size_t redeem_id_count;
   size_t next_redeem_index;
+  char target_workspaces[REG_TASK_TARGET_WS_LEN];
+  char aether_pool_type[REG_TASK_POOL_TYPE_LEN];
   struct registration_log_entry *logs;
   size_t log_len;
   size_t log_cap;
@@ -118,6 +123,8 @@ struct registration_flow_job {
   char proxy_url[FLOW_PROXY_LEN];
   char workspace_id[FLOW_WORKSPACE_ID_LEN];
   char redeem_code[FLOW_REDEEM_CODE_LEN];
+  char target_workspaces[REG_TASK_TARGET_WS_LEN];
+  char aether_pool_type[REG_TASK_POOL_TYPE_LEN];
   long account_id;
   long redeem_id;
   long deadline_ms;
@@ -1128,6 +1135,91 @@ static int apply_oauth_success(sqlite3 *db, struct registration_flow_job *job,
   return account_apply_oauth_success(db, job->account_id, &record);
 }
 
+/* 将换行/逗号/空格/分号分隔的目标工作区列表切分为独立字符串数组。
+ * 返回切分出的数量，失败或为空返回 0。out_ids 指向 buf 内的原地切片。 */
+static size_t parse_target_workspaces(char *buf, const char **out_ids,
+                                      size_t max_ids) {
+  size_t count = 0;
+  char *p = buf;
+  if (buf == NULL || out_ids == NULL || max_ids == 0) return 0;
+  while (*p != '\0' && count < max_ids) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',' ||
+           *p == ';') {
+      p++;
+    }
+    if (*p == '\0') break;
+    out_ids[count++] = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+           *p != ',' && *p != ';') {
+      p++;
+    }
+    if (*p != '\0') *p++ = '\0';
+  }
+  return count;
+}
+
+/* 兑换码路径：OAuth 成功后，对每个外部目标工作区执行上车 + 推送 aether。 */
+static void maybe_onboard_target_workspaces(sqlite3 *db,
+                                            struct registration_flow_job *job,
+                                            const struct flow_context *flow) {
+  char buf[REG_TASK_TARGET_WS_LEN];
+  const char *ids[64];
+  size_t count;
+  char *json;
+  struct mg_str body;
+  long join_success = 0, join_failed = 0, push_success = 0, push_failed = 0;
+  bool ok = false;
+  const char *pool_type;
+
+  if (db == NULL || job == NULL || flow == NULL) return;
+  if (job->target_workspaces[0] == '\0') return;
+  if (flow->access_token[0] == '\0' || flow->external_account_id[0] == '\0') {
+    task_log(job->task, flow->id, "warn",
+             "账号 ID=%ld 缺少 Access Token / Account ID，跳过上车与推送",
+             job->account_id);
+    return;
+  }
+  if (task_stop_requested(job->task)) return;
+
+  mg_snprintf(buf, sizeof(buf), "%s", job->target_workspaces);
+  count = parse_target_workspaces(buf, ids, sizeof(ids) / sizeof(ids[0]));
+  if (count == 0) return;
+
+  pool_type = job->aether_pool_type[0] ? job->aether_pool_type : "oauth";
+  task_log(job->task, flow->id, "info",
+           "账号 ID=%ld OAuth 成功，开始对 %lu 个目标工作区上车并推送 aether",
+           job->account_id, (unsigned long) count);
+
+  json = workspace_onboard_and_push_json(
+      db, job->identity.email, flow->access_token, flow->refresh_token,
+      flow->external_account_id, ids, count, pool_type);
+  if (json == NULL) {
+    task_log(job->task, flow->id, "error",
+             "账号 ID=%ld 上车/推送链路返回空结果", job->account_id);
+    return;
+  }
+  body = mg_str(json);
+  ok = mg_json_get_long(body, "$.ok", 0) == 1;
+  join_success = mg_json_get_long(body, "$.join_success", 0);
+  join_failed = mg_json_get_long(body, "$.join_failed", 0);
+  push_success = mg_json_get_long(body, "$.push_success", 0);
+  push_failed = mg_json_get_long(body, "$.push_failed", 0);
+  if (ok && push_failed == 0 && join_failed == 0) {
+    task_log(job->task, flow->id, "info",
+             "账号 ID=%ld 上车/推送完成：上车成功 %ld，推送成功 %ld",
+             job->account_id, join_success, push_success);
+  } else {
+    char *error = mg_json_get_str(body, "$.error");
+    task_log(job->task, flow->id, "warn",
+             "账号 ID=%ld 上车/推送存在失败：上车 %ld/%ld，推送 %ld/%ld %s",
+             job->account_id, join_success, join_success + join_failed,
+             push_success, push_success + push_failed,
+             error ? error : "");
+    mg_free(error);
+  }
+  free(json);
+}
+
 static void maybe_auto_upload_oauth_success(sqlite3 *db,
                                             struct registration_flow_job *job,
                                             const struct flow_context *flow) {
@@ -1362,6 +1454,7 @@ static void *flow_worker(void *arg) {
       oauth_flow.status == FLOW_STATUS_SUCCESS) {
     if (apply_oauth_success(db, job, &oauth_flow) == 0) {
       record_oauth_success(job->task, &oauth_flow, job->account_id);
+      maybe_onboard_target_workspaces(db, job, &oauth_flow);
       maybe_auto_upload_oauth_success(db, job, &oauth_flow);
     } else {
       record_oauth_failure(job->task, &oauth_flow, job->account_id,
@@ -1400,6 +1493,10 @@ static int launch_flow_job(struct registration_task *task,
   job->redeem_id = redeem_id;
   job->scheduler_stage = initial_stage;
   job->auto_upload_oauth_success = task->auto_upload_oauth_success;
+  mg_snprintf(job->target_workspaces, sizeof(job->target_workspaces), "%s",
+              task->target_workspaces);
+  mg_snprintf(job->aether_pool_type, sizeof(job->aether_pool_type), "%s",
+              task->aether_pool_type);
   job->oauth_delay_seconds =
       workflow == REG_WORKFLOW_REGISTER_THEN_OAUTH ? task->oauth_delay_seconds : 0;
   if (identity != NULL) job->identity = *identity;
@@ -1633,6 +1730,14 @@ int registration_tasks_start(const struct registration_start_options *options,
   task->auto_upload_oauth_success =
       options->auto_upload_oauth_success &&
       options->workflow != REG_WORKFLOW_REGISTER_ONLY;
+  if (options->target_workspaces != NULL) {
+    mg_snprintf(task->target_workspaces, sizeof(task->target_workspaces), "%s",
+                options->target_workspaces);
+  }
+  if (options->aether_pool_type != NULL) {
+    mg_snprintf(task->aether_pool_type, sizeof(task->aether_pool_type), "%s",
+                options->aether_pool_type);
+  }
   task->infinite = options->workflow == REG_WORKFLOW_OAUTH_ONLY ||
                            options->register_provider ==
                                REG_REGISTER_PROVIDER_REDEEM

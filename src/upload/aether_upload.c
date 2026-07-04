@@ -1187,3 +1187,96 @@ done:
   free(api_url); free(management_token); free(provider_id);
   return (char *) out.buf;
 }
+
+char *aether_upload_credential_json(sqlite3 *db,
+                                    const struct aether_push_credential *cred,
+                                    const char *pool_type) {
+  struct aether_service svc;
+  struct upload_account account;
+  struct mg_iobuf credentials = {0, 0, 0, 1024};
+  struct mg_iobuf out = {0, 0, 0, 512};
+  struct http_client_response res;
+  bool include_web = false;
+  const char *provider_id;
+  int rc;
+  bool success = false;
+  char *message = NULL;
+
+  memset(&svc, 0, sizeof(svc));
+  memset(&account, 0, sizeof(account));
+  memset(&res, 0, sizeof(res));
+
+  if (cred == NULL || !has_text(cred->access_token)) {
+    return error_json("缺少 Access Token，无法推送到 Aether");
+  }
+  if (normalize_pool_type(pool_type, &include_web) != 0) {
+    return error_json("不支持的 Aether 上传号池类型");
+  }
+  if (load_default_service(db, include_web, &svc) != 0) {
+    return error_json(include_web
+                          ? "未找到配置 ChatGPT Web 号池的 Aether 上传服务"
+                          : "未找到已启用的 Aether 上传服务，请先配置");
+  }
+  provider_id = include_web ? svc.chatgpt_web_provider_id : svc.provider_id;
+  if (!has_text(svc.api_url) || !has_text(svc.management_token) ||
+      !has_text(provider_id)) {
+    free_service(&svc);
+    return error_json("Aether 上传服务配置不完整");
+  }
+
+  /* upload_account 内部字段为 char*，此处指向传入常量的可写副本。 */
+  account.email = str_dup(cred->email ? cred->email : "");
+  account.access_token = str_dup(cred->access_token);
+  account.refresh_token = str_dup(cred->refresh_token ? cred->refresh_token : "");
+  account.external_account_id =
+      str_dup(cred->external_account_id ? cred->external_account_id : "");
+  account.workspace_id = str_dup(cred->workspace_id ? cred->workspace_id : "");
+
+  mg_xprintf(mg_pfn_iobuf, &credentials, "[");
+  append_credential_entry(&credentials, &account, include_web);
+  mg_xprintf(mg_pfn_iobuf, &credentials, "]");
+  mg_iobuf_add(&credentials, credentials.len, "", 1);
+
+  rc = post_batch_import(&svc, provider_id, (char *) credentials.buf, &res);
+  if (rc != 0 || res.status_code < 200 || res.status_code >= 300) {
+    message = extract_error_message(&res, "Aether 上传失败");
+  } else {
+    struct mg_str rbody = mg_str(res.body ? res.body : "");
+    char *status = json_result_string(rbody, 0, "status");
+    char *rmessage = json_result_string(rbody, 0, "message");
+    char *rerror = json_result_string(rbody, 0, "error");
+    long top_failed = json_long_default(rbody, "$.failed", -1);
+    if (text_equals_ci(status, "success") || text_equals_ci(status, "ok") ||
+        text_equals_ci(status, "uploaded") ||
+        is_already_exists_error(rerror) || is_already_exists_error(rmessage) ||
+        (status == NULL && rmessage == NULL && rerror == NULL &&
+         top_failed == 0)) {
+      success = true;
+    } else {
+      message = str_dup(has_text(rerror) ? rerror
+                        : has_text(rmessage) ? rmessage
+                                             : "Aether 返回结果不完整");
+    }
+    mg_free(status);
+    mg_free(rmessage);
+    mg_free(rerror);
+  }
+
+  update_upload_stats(db, 1, success ? 1 : 0, success ? 0 : 1, 0,
+                      success ? "上传完成" : (message ? message : "上传未成功"));
+
+  mg_xprintf(mg_pfn_iobuf, &out, "{%m:%d,%m:%d,%m:%m,%m:%m}", MG_ESC("ok"),
+             success ? 1 : 0, MG_ESC("success"), success ? 1 : 0,
+             MG_ESC("workspace_id"),
+             MG_ESC(cred->workspace_id ? cred->workspace_id : ""),
+             MG_ESC(success ? "message" : "error"),
+             MG_ESC(success ? "推送成功" : (message ? message : "推送失败")));
+  mg_iobuf_add(&out, out.len, "", 1);
+
+  free(message);
+  free_upload_account(&account);
+  free(credentials.buf);
+  http_client_response_free(&res);
+  free_service(&svc);
+  return (char *) out.buf;
+}

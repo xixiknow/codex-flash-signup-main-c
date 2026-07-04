@@ -271,12 +271,16 @@ static void handle_redeem_api(struct mg_connection *c,
     long *ids = NULL;
     size_t count = parse_id_array(hm->body, &ids);
     char *workflow = mg_json_get_str(hm->body, "$.workflow");
+    char *target_workspaces = mg_json_get_str(hm->body, "$.target_workspaces");
+    char *pool_type = mg_json_get_str(hm->body, "$.aether_pool_type");
     bool detailed = false;
     bool auto_upload = false;
 
     if (count == 0) {
       free(ids);
       mg_free(workflow);
+      mg_free(target_workspaces);
+      mg_free(pool_type);
       mg_http_reply(c, 400, JSON_HEADERS, "{%m:%d,%m:%m}\n", MG_ESC("ok"), 0,
                     MG_ESC("error"), MG_ESC("请先选择要注册的兑换码"));
       return;
@@ -292,6 +296,14 @@ static void handle_redeem_api(struct mg_connection *c,
     if (workflow != NULL && strcmp(workflow, "register_then_oauth") == 0) {
       options.workflow = REG_WORKFLOW_REGISTER_THEN_OAUTH;
     }
+    /* 有目标工作区时，必须走 OAuth 才能拿到 workspace-scoped token 用于上车与推送。 */
+    if (target_workspaces != NULL && target_workspaces[0] != '\0') {
+      options.workflow = REG_WORKFLOW_REGISTER_THEN_OAUTH;
+      options.target_workspaces = target_workspaces;
+    }
+    if (pool_type != NULL && pool_type[0] != '\0') {
+      options.aether_pool_type = pool_type;
+    }
     if (mg_json_get_bool(hm->body, "$.detailed_logs", &detailed)) {
       options.detailed_logs = detailed;
     }
@@ -302,11 +314,15 @@ static void handle_redeem_api(struct mg_connection *c,
     if (registration_tasks_start(&options, task_id, sizeof(task_id), error,
                                  sizeof(error)) != 0) {
       free(ids);
+      mg_free(target_workspaces);
+      mg_free(pool_type);
       mg_http_reply(c, 400, JSON_HEADERS, "{%m:%d,%m:%m}\n", MG_ESC("ok"), 0,
                     MG_ESC("error"), MG_ESC(error));
       return;
     }
     free(ids);
+    mg_free(target_workspaces);
+    mg_free(pool_type);
     mg_http_reply(c, 200, JSON_HEADERS, "{%m:%d,%m:%m,%m:%d}\n", MG_ESC("ok"), 1,
                   MG_ESC("task_id"), MG_ESC(task_id), MG_ESC("affected"),
                   (int) count);

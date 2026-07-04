@@ -1,6 +1,7 @@
 #include "workspace/workspace_ops.h"
 
 #include "http_client/http_client.h"
+#include "upload/aether_upload.h"
 #include "mongoose.h"
 
 #include <sqlite3.h>
@@ -369,6 +370,116 @@ char *workspace_export_json(sqlite3 *db, const long *ids, size_t count,
              MG_ESC(filename), MG_ESC("content"),
              MG_ESC((char *) content.buf));
   mg_iobuf_free(&content);
+  mg_iobuf_add(&io, io.len, "", 1);
+  return (char *) io.buf;
+}
+
+char *workspace_onboard_and_push_json(sqlite3 *db, const char *email,
+                                      const char *access_token,
+                                      const char *refresh_token,
+                                      const char *external_account_id,
+                                      const char *const *target_workspace_ids,
+                                      size_t target_count,
+                                      const char *pool_type) {
+  struct mg_iobuf io = {0, 0, 0, 512};
+  int join_success = 0, join_failed = 0;
+  int push_success = 0, push_failed = 0;
+  bool first = true;
+
+  mg_xprintf(mg_pfn_iobuf, &io, "{%m:%d,%m:[", MG_ESC("ok"), 1,
+             MG_ESC("details"));
+
+  if (access_token == NULL || access_token[0] == '\0' ||
+      external_account_id == NULL || external_account_id[0] == '\0') {
+    mg_xprintf(mg_pfn_iobuf, &io, "],%m:%d,%m:%d,%m:%d,%m:%d,%m:%d,%m:%m}",
+               MG_ESC("join_success"), 0, MG_ESC("join_failed"), 0,
+               MG_ESC("push_success"), 0, MG_ESC("push_failed"), 0,
+               MG_ESC("ok"), 0, MG_ESC("error"),
+               MG_ESC("缺少 Access Token 或 Account ID，无法执行上车与推送"));
+    mg_iobuf_add(&io, io.len, "", 1);
+    return (char *) io.buf;
+  }
+
+  for (size_t i = 0; i < target_count; i++) {
+    const char *ws = target_workspace_ids ? target_workspace_ids[i] : NULL;
+    char url[512];
+    char join_error[256] = "";
+    long join_status = 0;
+    bool joined;
+
+    if (ws == NULL || ws[0] == '\0') continue;
+    if (!first) mg_xprintf(mg_pfn_iobuf, &io, ",");
+    first = false;
+
+    /* 上车：加入外部目标工作区（target workspace 作为 URL 中的 account id）。 */
+    mg_snprintf(url, sizeof(url),
+                CHATGPT_BASE_URL "/backend-api/accounts/%s/invites/request", ws);
+    joined = workspace_request("POST", url, access_token, "{}", &join_status,
+                               join_error, sizeof(join_error)) == 0;
+    if (joined) {
+      join_success++;
+    } else {
+      join_failed++;
+    }
+
+    mg_xprintf(mg_pfn_iobuf, &io,
+               "{%m:%m,%m:%d,%m:%ld", MG_ESC("workspace_id"), MG_ESC(ws),
+               MG_ESC("join_ok"), joined ? 1 : 0, MG_ESC("join_http_status"),
+               join_status);
+    if (!joined) {
+      mg_xprintf(mg_pfn_iobuf, &io, ",%m:%m", MG_ESC("join_error"),
+                 MG_ESC(join_error));
+    }
+
+    /* 推送 aether：即便上车失败也尝试推送（工作区可能已加入过），
+     * 每个目标工作区都用其自身 workspace_id 标记推送一次。 */
+    {
+      struct aether_push_credential cred;
+      char *push_json;
+      bool push_ok = false;
+      char push_err[256] = "";
+
+      memset(&cred, 0, sizeof(cred));
+      cred.email = email;
+      cred.access_token = access_token;
+      cred.refresh_token = refresh_token;
+      cred.external_account_id = external_account_id;
+      cred.workspace_id = ws;
+      push_json = aether_upload_credential_json(db, &cred, pool_type);
+      if (push_json != NULL) {
+        struct mg_str pb = mg_str(push_json);
+        push_ok = mg_json_get_long(pb, "$.success", 0) == 1;
+        if (!push_ok) {
+          char *e = mg_json_get_str(pb, "$.error");
+          if (e != NULL) {
+            mg_snprintf(push_err, sizeof(push_err), "%s", e);
+            mg_free(e);
+          }
+        }
+        free(push_json);
+      } else {
+        mg_snprintf(push_err, sizeof(push_err), "%s", "Aether 推送失败");
+      }
+      if (push_ok) {
+        push_success++;
+      } else {
+        push_failed++;
+      }
+      mg_xprintf(mg_pfn_iobuf, &io, ",%m:%d", MG_ESC("push_ok"),
+                 push_ok ? 1 : 0);
+      if (!push_ok) {
+        mg_xprintf(mg_pfn_iobuf, &io, ",%m:%m", MG_ESC("push_error"),
+                   MG_ESC(push_err));
+      }
+    }
+
+    mg_xprintf(mg_pfn_iobuf, &io, "}");
+  }
+
+  mg_xprintf(mg_pfn_iobuf, &io,
+             "],%m:%d,%m:%d,%m:%d,%m:%d}", MG_ESC("join_success"), join_success,
+             MG_ESC("join_failed"), join_failed, MG_ESC("push_success"),
+             push_success, MG_ESC("push_failed"), push_failed);
   mg_iobuf_add(&io, io.len, "", 1);
   return (char *) io.buf;
 }
